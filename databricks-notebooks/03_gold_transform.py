@@ -3,20 +3,20 @@ from pyspark.sql.functions import lit, col, expr, current_timestamp, to_timestam
 from delta.tables import DeltaTable
 from pyspark.sql import Window
 
-#ADLS configuration 
+# ADLS configuration 
 spark.conf.set(
-  "fs.azure.account.key.<<Storageaccount_name>>.dfs.core.windows.net",
-  "<<Storage_Account_access_key>>"
+  "fs.azure.account.key.hospitalstorage10.dfs.core.windows.net",
+  dbutils.secrets.get(scope="hospitalanalyticsvaultscope", key="storage-connection")
 )
 
-
 # Paths (FIXED - unique folders per table)
-silver_path = "<<path>>"
+silver_path = "abfss://silver@hospitalstorage10.dfs.core.windows.net/patient_flow"
 
 gold_base = "abfss://gold@hospitalstorage10.dfs.core.windows.net/patient_flow_gold"
-gold_dim_patient    = f"{gold_base}/<<path>>"
-gold_dim_department = f"{gold_base}/<<path>>"
-gold_fact           = f"{gold_base}/<<path>>"
+gold_dim_patient    = f"{gold_base}/dim_patient"
+gold_dim_department = f"{gold_base}/dim_department"
+gold_fact           = f"{gold_base}/fact_admissions"
+
 
 # Read silver data (assume append-only)
 silver_df = spark.read.format("delta").load(silver_path)
@@ -31,7 +31,7 @@ silver_df = (
     .drop("row_num")
 )
 
-#Patient Dimension Table Creation
+# Patient Dimension Table Creation
 # Prepare incoming dimension records (deduplicated per patient, latest record)
 incoming_patient = (silver_df
                     .select("patient_id", "gender", "age")
@@ -107,7 +107,6 @@ if inserts_df.count() > 0:
     inserts_df.write.format("delta").mode("append").save(gold_dim_patient)
 
 
-
 # Department Dimension Table Creation
 
 # prepare incoming (latest per patient feed snapshot)
@@ -123,7 +122,6 @@ incoming_dept = incoming_dept.dropDuplicates(["department", "hospital_id"]) \
 
 incoming_dept.select("surrogate_key", "department", "hospital_id") \
     .write.format("delta").mode("overwrite").save(gold_dim_department)
-
 
 
 # Create Fact table
@@ -171,6 +169,62 @@ fact_final = fact_enriched.select(
 # Persist fact table partitioned by admission_date (helps Synapse / queries)
 fact_final.write.format("delta").mode("overwrite").save(gold_fact)
 
+
+spark.conf.set("spark.sql.parquet.outputTimestampType", "INT96")  # Synapse-friendly timestamps
+
+export_base = "abfss://gold@hospitalstorage10.dfs.core.windows.net/patient_flow_gold/synapse_exports"
+export_dim_patient = f"{export_base}/dim_patient"
+export_dim_department = f"{export_base}/dim_department"
+export_fact = f"{export_base}/fact_patient_flow"
+
+# Clear old exports so Synapse doesn't read leftover files
+for p in [export_dim_patient, export_dim_department, export_fact]:
+    dbutils.fs.rm(p, True)
+
+# DIM PATIENT (current rows only for BI relationships)
+(
+  spark.read.format("delta").load(gold_dim_patient)
+    .filter(col("is_current") == True)
+    .select(
+      col("patient_id").cast("string"),
+      col("gender").cast("string"),
+      col("age").cast("int"),
+      col("effective_from").cast("timestamp"),
+      col("surrogate_key").cast("long"),
+      col("effective_to").cast("timestamp"),
+      col("is_current").cast("int").alias("is_current")   # int plays nicer than boolean/bit
+    )
+    .write.mode("overwrite").format("parquet").save(export_dim_patient)
+)
+
+# DIM DEPARTMENT
+(
+  spark.read.format("delta").load(gold_dim_department)
+    .select(
+      col("department").cast("string"),
+      col("hospital_id").cast("int"),
+      col("surrogate_key").cast("long")
+    )
+    .write.mode("overwrite").format("parquet").save(export_dim_department)
+)
+
+# FACT
+(
+  spark.read.format("delta").load(gold_fact)
+    .select(
+      col("fact_id").cast("long"),
+      col("patient_sk").cast("long"),
+      col("department_sk").cast("long"),
+      col("admission_time").cast("timestamp"),
+      col("discharge_time").cast("timestamp"),
+      col("admission_date").cast("date"),
+      col("length_of_stay_hours").cast("double"),
+      col("is_currently_admitted").cast("int").alias("is_currently_admitted"),
+      col("bed_id").cast("int"),
+      col("event_ingestion_time").cast("timestamp")
+    )
+    .write.mode("overwrite").format("parquet").save(export_fact)
+)
 
 # Quick sanity checks
 print("Patient dim count:", spark.read.format("delta").load(gold_dim_patient).count())
